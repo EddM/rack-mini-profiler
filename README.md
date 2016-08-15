@@ -6,7 +6,7 @@ Middleware that displays speed badge for every html page. Designed to work both 
 
 #### Features
 
-* database profiling. Currently supports Mysql2, Postgres, and Mongoid3 (with fallback support to ActiveRecord)
+* database profiling. Currently supports Mysql2, Postgres, Oracle (oracle_enhanced ~> 1.5.0) and Mongoid3 (with fallback support to ActiveRecord)
 
 #### Learn more
 
@@ -66,11 +66,17 @@ end
 
 ```ruby
 require 'rack-mini-profiler'
+
+home = lambda { |env|
+  [200, {'Content-Type' => 'text/html'}, ["<html><body>hello!</body></html>"]]
+}
+
 builder = Rack::Builder.new do
   use Rack::MiniProfiler
-
-  map('/')    { run get }
+  map('/') { run home }
 end
+
+run builder
 ```
 
 #### Sinatra
@@ -82,6 +88,29 @@ class MyApp < Sinatra::Base
 end
 ```
 
+#### Patching ActiveRecord
+
+A typical web application spends a lot of time querying the database. rack_mini_profiler will detect the ORM that is available
+and apply patches to properly collect query statistics.
+
+To make this work, declare the orm's gem before declaring `rack-mini-profiler` in the `Gemfile`:
+
+```ruby
+gem 'pg'
+gem 'mongoid'
+gem 'rack-mini-profiler'
+
+```
+
+If you wish to override this behavior, the environment variable `RACK_MINI_PROFILER_PATCH` is available.
+
+```bash
+export RACK_MINI_PROFILER_PATCH="pg,mongoid"
+# or
+export RACK_MINI_PROFILER_PATCH="false"
+# initializers/rack_profiler.rb: SqlPatches.patch %w(mongo)
+```
+
 ### Flamegraphs
 
 To generate [flamegraphs](http://samsaffron.com/archive/2013/03/19/flame-graphs-in-ruby-miniprofiler):
@@ -89,20 +118,21 @@ To generate [flamegraphs](http://samsaffron.com/archive/2013/03/19/flame-graphs-
 * add the [**flamegraph**](https://github.com/SamSaffron/flamegraph) gem to your Gemfile
 * visit a page in your app with `?pp=flamegraph`
 
-Flamegraph generation is supported in MRI 2.0 and 2.1 only.
+Flamegraph generation is supported in MRI 2.0, 2.1, and 2.2 only.
 
 
-## Access control in production
+## Access control in non-development environments
 
 rack-mini-profiler is designed with production profiling in mind. To enable that just run `Rack::MiniProfiler.authorize_request` once you know a request is allowed to profile.
 
 ```ruby
-# A hook in your ApplicationController
-def authorize
-  if current_user.is_admin?
-    Rack::MiniProfiler.authorize_request
+  # inside your ApplicationController
+
+  before_action do
+    if current_user && current_user.is_admin?
+      Rack::MiniProfiler.authorize_request
+    end
   end
-end
 ```
 
 ## Configuration
@@ -121,7 +151,7 @@ To disable this behavior, use the following config setting:
 
 ```ruby
 # Do not let rack-mini-profiler disable caching
-Rack::MiniProfiler.config.disable_caching = false # defaults to true 
+Rack::MiniProfiler.config.disable_caching = false # defaults to true
 ```
 
 ### Storage
@@ -144,11 +174,11 @@ if Rails.env.production?
 end
 ```
 
-MemoryStore stores results in a processes heap - something that does not work well in a multi process environment.
-FileStore stores results in the file system - something that may not work well in a multi machine environment.
-RedisStore/MemcacheStore work in multi process and multi machine environments (RedisStore only saves results for up to 24 hours so it won't continue to fill up Redis).
+`MemoryStore` stores results in a processes heap - something that does not work well in a multi process environment.
+`FileStore` stores results in the file system - something that may not work well in a multi machine environment.
+`RedisStore`/`MemcacheStore` work in multi process and multi machine environments (`RedisStore` only saves results for up to 24 hours so it won't continue to fill up Redis). You will need to add `gem redis`/`gem dalli` respectively to your `Gemfile` to use these stores.
 
-Additionally you may implement an AbstractStore for your own provider.
+Additionally you may implement an `AbstractStore` for your own provider.
 
 ### User result segregation
 
@@ -166,6 +196,38 @@ Rack::MiniProfiler.config.user_provider = Proc.new{ |env| CurrentUser.get(env) }
 
 The string this function returns should be unique for each user on the system (for anonymous you may need to fall back to ip address)
 
+### Profiling specific methods
+
+You can increase the granularity of profiling by measuring the performance of specific methods. Add methods of interest to an initializer.
+
+```ruby
+Rails.application.config.to_prepare do
+  ::Rack::MiniProfiler.profile_singleton_method(User, :non_admins) { |a| "executing all_non_admins" }
+  ::Rack::MiniProfiler.profile_method(User, :favorite_post) { |a| "executing favorite_post" }
+end
+```
+
+### Using in SPA applications
+
+Single page applications built using Ember, Angular or other frameworks need some special care, as routes often change without a full page load.
+
+On route transition always call:
+
+```
+window.MiniProfiler.pageTransition();
+```
+
+This method will remove profiling information that was related to previous page and clear aggregate statistics.
+
+#### MiniProfiler's speed badge on pages that are not generated via Rails
+You need to inject the following in your SPA to load MiniProfiler's speed badge ([extra details surrounding this script](https://github.com/MiniProfiler/rack-mini-profiler/issues/139#issuecomment-192880706)):
+
+```html
+ <script async type="text/javascript" id="mini-profiler" src="/mini-profiler-resources/includes.js?v=12b4b45a3c42e6e15503d7a03810ff33" data-version="12b4b45a3c42e6e15503d7a03810ff33" data-path="/mini-profiler-resources/" data-current-id="redo66j4g1077kto8uh3" data-ids="redo66j4g1077kto8uh3" data-position="left" data-trivial="false" data-children="false" data-max-traces="10" data-controls="false" data-authorized="true" data-toggle-shortcut="Alt+P" data-start-hidden="false" data-collapse-results="true"></script>
+```
+
+_Note:_ The GUID (`data-version` and the `?v=` parameter on the `src`) will change with each release of `rack_mini_profiler`. The MiniProfiler's speed badge will continue to work, although you will have to change the GUID to expire the script to fetch the most recent version.
+
 ### Configuration Options
 
 You can set configuration options using the configuration accessor on `Rack::MiniProfiler`.
@@ -177,16 +239,24 @@ Rack::MiniProfiler.config.start_hidden = true
 ```
 The available configuration options are:
 
-* pre_authorize_cb - A lambda callback you can set to determine whether or not mini_profiler should be visible on a given request. Default in a Rails environment is only on in development mode. If in a Rack app, the default is always on.
-* position - Can either be 'right' or 'left'. Default is 'left'.
-* skip_paths - Specifies path list that can be skipped.
-* skip_schema_queries - Whether or not you want to log the queries about the schema of your tables. Default is 'false', 'true' in rails development.
-* auto_inject (default true) - when false the miniprofiler script is not injected in the page
-* backtrace_filter - a regex you can use to filter out unwanted lines from the backtraces
-* toggle_shortcut (default Alt+P) - a jquery.hotkeys.js-style keyboard shortcut, used to toggle the mini_profiler's visibility. See https://github.com/jeresig/jquery.hotkeys for more info.
-* start_hidden (default false) - Whether or not you want the mini_profiler to be visible when loading a page
-* backtrace_threshold_ms (default zero) - Minimum SQL query elapsed time before a backtrace is recorded. Backtrace recording can take a couple of milliseconds on rubies earlier than 2.0, impacting performance for very small queries.
-* flamegraph_sample_rate (default 0.5ms) - How often fast_stack should get stack trace info to generate flamegraphs
+Option|Default|Description
+-------|---|--------
+pre_authorize_cb|Rails: dev only<br>Rack: always on|A lambda callback that returns true to make mini_profiler visible on a given request.
+position|`'left'`|Display mini_profiler on `'right'` or `'left'`.
+skip_paths|`[]`|Paths that skip profiling.
+skip_schema_queries|Rails dev: `'true'`<br>Othwerwise: `'false'`|`'true'` to log schema queries.
+auto_inject|`true`|`true` to inject the miniprofiler script in the page.
+backtrace_ignores|`[]`|Regexes of lines to be removed from backtraces.
+backtrace_includes|Rails: `[/^\/?(app|config|lib|test)/]`<br>Rack: `[]`|Regexes of lines to keep in backtraces.
+backtrace_remove|rails: `Rails.root`<br>Rack: `nil`|A string or regex to remove part of each line in the backtrace.
+toggle_shortcut|Alt+P|Keyboard shortcut to toggle the mini_profiler's visibility. See [jquery.hotkeys](https://github.com/jeresig/jquery.hotkeys).
+start_hidden|`false`|`false` to make mini_profiler visible on page load.
+backtrace_threshold_ms|`0`|Minimum SQL query elapsed time before a backtrace is recorded. Backtrace recording can take a couple of milliseconds on rubies earlier than 2.0, impacting performance for very small queries.
+flamegraph_sample_rate|`0.5`|How often to capture stack traces for flamegraphs in milliseconds.
+disable_env_dump|`false`|`true` disables `?pp=env`, which prevents sending ENV vars over HTTP.
+base_url_path|`'/mini-profiler-resources/'`|Path for assets; added as a prefix when naming assets and sought when responding to requests.
+collapse_results|`true`|If multiple timing results exist in a single page, collapse them till clicked.
+max_traces_to_show|20|Maximum number of mini profiler timing blocks to show on one page
 
 ### Custom middleware ordering (required if using `Rack::Deflate` with Rails)
 

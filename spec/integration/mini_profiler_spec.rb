@@ -30,6 +30,12 @@ describe Rack::MiniProfiler do
       map '/html' do
         run lambda { |env| [200, {'Content-Type' => 'text/html'}, "<html><BODY><h1>Hi</h1></BODY>\n \t</html>"] }
       end
+      map '/whitelisted-html' do
+        run lambda { |env|
+          Rack::MiniProfiler.authorize_request
+          [200, {'Content-Type' => 'text/html'}, "<html><BODY><h1>Hi</h1></BODY>\n \t</html>"]
+        }
+      end
       map '/implicitbody' do
         run lambda { |env| [200, {'Content-Type' => 'text/html'}, "<html><h1>Hi</h1></html>"] }
       end
@@ -58,6 +64,13 @@ describe Rack::MiniProfiler do
         run lambda { |env|
           env['SCRIPT_NAME'] = '/rails_engine'  # Rails engines do that
           [200, {'Content-Type' => 'text/html'}, '<html><h1>Hi</h1></html>']
+        }
+      end
+      map '/under_passenger' do
+        run lambda { |env|
+          env['SCRIPT_NAME'] = '/under_passenger'
+          ENV['PASSENGER_BASE_URI'] = '/under_passenger'
+          [200, {'Content-Type' => 'text/html'}, '<html><h1>and I ride and I ride</h1></html>']
         }
       end
     }.to_app
@@ -100,7 +113,7 @@ describe Rack::MiniProfiler do
 
     it 'avoids xss attacks' do
       h = last_response.headers['X-MiniProfiler-Ids']
-      id = ::JSON.parse(h)[0]
+      _id = ::JSON.parse(h)[0]
       get "/mini-profiler-resources/results?id=%22%3E%3Cqss%3E"
       last_response.should_not be_ok
       last_response.body.should_not =~ /<qss>/
@@ -134,6 +147,20 @@ describe Rack::MiniProfiler do
 
   end
 
+  describe 'within a Rails application' do
+
+    before do
+      mock_controller = double
+      mock_controller.should_receive(:url_for).with('/mini-profiler-resources/').and_return('/test/mini-profiler-resources/')
+      get '/html', nil, 'action_controller.instance' => mock_controller
+    end
+
+    it 'has the JS in the body with the correct path' do
+      last_response.body.include?('/test/mini-profiler-resources/includes.js').should be_true
+    end
+
+  end
+
 
   describe 'with a SCRIPT_NAME' do
 
@@ -157,6 +184,18 @@ describe Rack::MiniProfiler do
     it 'include the correct JS in the body' do
       last_response.body.include?('/rails_engine/mini-profiler-resources/includes.js').should_not be_true
       last_response.body.include?('src="/mini-profiler-resources/includes.js').should be_true
+    end
+
+  end
+
+  describe 'under passenger' do
+
+    before do
+      get '/under_passenger'
+    end
+
+    it 'include the correct JS in the body' do
+      last_response.body.include?('src="/under_passenger/mini-profiler-resources/includes.js').should be_true
     end
 
   end
@@ -247,14 +286,36 @@ describe Rack::MiniProfiler do
       it "does not re-enable functionality if not whitelisted" do
         Rack::MiniProfiler.config.authorization_mode = :whitelist
         get '/html?pp=enable'
+        get '/html?pp=enable'
         last_response.body.should_not include('/mini-profiler-resources/includes.js')
       end
 
       it "re-enabled functionality if whitelisted" do
         Rack::MiniProfiler.config.authorization_mode = :whitelist
-        expect(Rack::MiniProfiler).to receive(:request_authorized?) { true }.twice
-        get '/html?pp=enable'
+        get '/whitelisted-html?pp=enable'
+        get '/whitelisted-html?pp=enable'
         last_response.body.should include('/mini-profiler-resources/includes.js')
+      end
+    end
+
+    describe 'disable_env_dump config option' do
+      context 'default (not configured' do
+        it 'allows env dump' do
+          get '/html?pp=env'
+
+          last_response.body.should include('QUERY_STRING')
+          last_response.body.should include('CONTENT_LENGTH')
+        end
+      end
+      context 'when enabled' do
+        it 'disables dumping the ENV over the web' do
+          Rack::MiniProfiler.config.disable_env_dump = true
+          get '/html?pp=env'
+
+          # Contains no ENV vars:
+          last_response.body.should_not include('QUERY_STRING')
+          last_response.body.should_not include('CONTENT_LENGTH')
+        end
       end
     end
   end
@@ -280,7 +341,9 @@ describe Rack::MiniProfiler do
     end
 
     it "should allow requests that are whitelisted" do
-      set_cookie("__profilin=stylin")
+      get '/whitelisted'
+      # second time will ensure cookie is set
+      # first time around there is no cookie, so no profiling
       get '/whitelisted'
       last_response.headers['X-MiniProfiler-Ids'].should_not be_nil
     end

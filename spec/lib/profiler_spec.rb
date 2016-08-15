@@ -56,6 +56,10 @@ describe Rack::MiniProfiler do
         def foo(bar,baz)
           return [bar, baz, yield]
         end
+
+        def self.bar(baz,boo)
+          return [baz, boo, yield]
+        end
       end
     end
 
@@ -63,6 +67,12 @@ describe Rack::MiniProfiler do
       Rack::MiniProfiler.profile_method TestClass, :foo
       TestClass.new.foo("a","b"){"c"}.should == ["a","b","c"]
       Rack::MiniProfiler.unprofile_method TestClass, :foo
+    end
+
+    it 'should not destroy a singleton method' do
+      Rack::MiniProfiler.profile_singleton_method TestClass, :bar
+      TestClass.bar("a", "b"){"c"}.should == ["a","b","c"]
+      Rack::MiniProfiler.unprofile_singleton_method TestClass, :bar
     end
 
   end
@@ -79,8 +89,8 @@ describe Rack::MiniProfiler do
 
     describe 'typical usage' do
       before(:all) do
-        Rack::MiniProfiler.create_current
         Time.now = Time.new
+        Rack::MiniProfiler.create_current
         Time.now += 1
         Rack::MiniProfiler.step('outer') {
           Time.now +=  2
@@ -120,9 +130,41 @@ describe Rack::MiniProfiler do
       it 'measures inner duration correctly' do
         @inner.duration_ms.to_i.should == 3 * 1000
       end
-
     end
-
   end
 
+  describe '#ids' do
+    let(:profiler) do
+      Rack::MiniProfiler.new(nil, :base_url_path => "/test-resource",
+                                  :storage       => Rack::MiniProfiler::MemoryStore,
+                                  :user_provider => Proc.new{|env| user_id },
+                            )
+    end
+
+    let(:current) { Rack::MiniProfiler.create_current }
+    let(:current_id) { current.page_struct[:id] }
+    let(:user_id) { "user1" }
+    let(:storage) { profiler.instance_variable_get(:@storage) } # not perfect but ...
+    before do
+      current
+    end
+
+    it "returns current id" do
+      expect(profiler.ids(user_id)).to eq([current_id])
+    end
+
+    it "uses existing ids" do
+      storage.set_unviewed(user_id, 1)
+      storage.set_unviewed(user_id, 2)
+
+      expect(profiler.ids(user_id)).to eq([current_id, 1, 2])
+    end
+
+    it "caps at config.max_traces_to_show ids" do
+      25.times { |i| storage.set_unviewed(user_id, i + 1) }
+
+      expect(profiler.ids(user_id)).to eq([current_id, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                           11, 12, 13, 14, 15, 16, 17, 18, 19])
+    end
+  end
 end

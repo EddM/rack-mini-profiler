@@ -17,6 +17,10 @@ module Rack
         @config ||= Config.default
       end
 
+      def resources_root
+        @resources_root ||= ::File.expand_path("../../html", __FILE__)
+      end
+
       def share_template
         @share_template ||= ::File.read(::File.expand_path("../html/share.html", ::File.dirname(__FILE__)))
       end
@@ -37,10 +41,11 @@ module Rack
 
       def create_current(env={}, options={})
         # profiling the request
-        self.current               = Context.new
-        self.current.inject_js     = config.auto_inject && (!env['HTTP_X_REQUESTED_WITH'].eql? 'XMLHttpRequest')
-        self.current.page_struct   = TimerStruct::Page.new(env)
-        self.current.current_timer = current.page_struct[:root]
+        context               = Context.new
+        context.inject_js     = config.auto_inject && (!env['HTTP_X_REQUESTED_WITH'].eql? 'XMLHttpRequest')
+        context.page_struct   = TimerStruct::Page.new(env)
+        context.current_timer = context.page_struct[:root]
+        self.current          = context
       end
 
       def authorize_request
@@ -92,46 +97,39 @@ module Rack
         @storage.set_viewed(user(env), id)
       end
 
-      result_json = page_struct.to_json
       # If we're an XMLHttpRequest, serve up the contents as JSON
       if request.xhr?
+        result_json = page_struct.to_json
         [200, { 'Content-Type' => 'application/json'}, [result_json]]
       else
-
         # Otherwise give the HTML back
-        html = MiniProfiler.share_template.dup
-        html.gsub!(/\{path\}/, "#{env['RACK_MINI_PROFILER_ORIGINAL_SCRIPT_NAME']}#{@config.base_url_path}")
-        html.gsub!(/\{version\}/, MiniProfiler::ASSET_VERSION)
-        html.gsub!(/\{json\}/, result_json)
-        html.gsub!(/\{includes\}/, get_profile_script(env))
-        html.gsub!(/\{name\}/, page_struct[:name])
-        html.gsub!(/\{duration\}/, "%.1f" % page_struct.duration_ms)
-
+        html = generate_html(page_struct, env)
         [200, {'Content-Type' => 'text/html'}, [html]]
       end
+    end
 
+    def generate_html(page_struct, env, result_json = page_struct.to_json)
+        html = MiniProfiler.share_template.dup
+        html.sub!('{path}', "#{env['RACK_MINI_PROFILER_ORIGINAL_SCRIPT_NAME']}#{@config.base_url_path}")
+        html.sub!('{version}', MiniProfiler::ASSET_VERSION)
+        html.sub!('{json}', result_json)
+        html.sub!('{includes}', get_profile_script(env))
+        html.sub!('{name}', page_struct[:name])
+        html.sub!('{duration}', page_struct.duration_ms.round(1).to_s)
+        html
     end
 
     def serve_html(env)
-      file_name = env['PATH_INFO'][(@config.base_url_path.length)..1000]
+      path      = env['PATH_INFO'].sub('//', '/')
+      file_name = path.sub(@config.base_url_path, '')
 
       return serve_results(env) if file_name.eql?('results')
 
-      full_path = ::File.expand_path("../html/#{file_name}", ::File.dirname(__FILE__))
-      return [404, {}, ["Not found"]] unless ::File.exists? full_path
-      f      = Rack::File.new nil
-      f.path = full_path
+      resources_env = env.dup
+      resources_env['PATH_INFO'] = file_name
 
-      begin
-        f.cache_control = "max-age:86400"
-        f.serving env
-      rescue
-        # old versions of rack have a different api
-        status, headers, body = f.serving
-        headers.merge! 'Cache-Control' => "max-age:86400"
-        [status, headers, body]
-      end
-
+      rack_file = Rack::File.new(MiniProfiler.resources_root, {'Cache-Control' => 'max-age:86400'})
+      rack_file.call(resources_env)
     end
 
 
@@ -151,11 +149,13 @@ module Rack
 
     def call(env)
 
-      client_settings = ClientSettings.new(env)
+      start = Time.now
+      client_settings = ClientSettings.new(env, @storage, start)
+      MiniProfiler.deauthorize_request if @config.authorization_mode == :whitelist
 
       status = headers = body = nil
       query_string = env['QUERY_STRING']
-      path         = env['PATH_INFO']
+      path         = env['PATH_INFO'].sub('//', '/')
 
       # Someone (e.g. Rails engine) could change the SCRIPT_NAME so we save it
       env['RACK_MINI_PROFILER_ORIGINAL_SCRIPT_NAME'] = env['SCRIPT_NAME']
@@ -164,18 +164,15 @@ module Rack
                 (@config.skip_paths && @config.skip_paths.any?{ |p| path.start_with?(p) }) ||
                 query_string =~ /pp=skip/
 
-      has_profiling_cookie = client_settings.has_cookie?
-
-      if skip_it || (@config.authorization_mode == :whitelist && !has_profiling_cookie)
-        status,headers,body = @app.call(env)
-        if !skip_it && @config.authorization_mode == :whitelist && !has_profiling_cookie && MiniProfiler.request_authorized?
-          client_settings.write!(headers)
-        end
-        return [status,headers,body]
+      if skip_it || (
+        @config.authorization_mode == :whitelist &&
+        !client_settings.has_valid_cookie?
+      )
+        return client_settings.handle_cookie(@app.call(env))
       end
 
       # handle all /mini-profiler requests here
-      return serve_html(env) if path.start_with? @config.base_url_path
+      return client_settings.handle_cookie(serve_html(env)) if path.start_with? @config.base_url_path
 
       has_disable_cookie = client_settings.disable_profiling?
       # manual session disable / enable
@@ -183,7 +180,7 @@ module Rack
         skip_it = true
       end
 
-      if query_string =~ /pp=enable/ && (@config.authorization_mode != :whitelist || MiniProfiler.request_authorized?)
+      if query_string =~ /pp=enable/
         skip_it = false
         config.enabled = true
       end
@@ -191,32 +188,35 @@ module Rack
       if skip_it || !config.enabled
         status,headers,body = @app.call(env)
         client_settings.disable_profiling = true
-        client_settings.write!(headers)
-        return [status,headers,body]
+        return client_settings.handle_cookie([status,headers,body])
       else
         client_settings.disable_profiling = false
       end
 
+      # profile gc
       if query_string =~ /pp=profile-gc/
         current.measure = false if current
+        return client_settings.handle_cookie(Rack::MiniProfiler::GCProfiler.new.profile_gc(@app, env))
+      end
 
-        if query_string =~ /pp=profile-gc-time/
-          return Rack::MiniProfiler::GCProfiler.new.profile_gc_time(@app, env)
-        elsif query_string =~ /pp=profile-gc-ruby-head/
-          result = StringIO.new
-          report = MemoryProfiler.report do
-            _,_,body = @app.call(env)
-            body.close if body.respond_to? :close
-          end
-          report.pretty_print(result)
-          return text_result(result.string)
-        else
-          return Rack::MiniProfiler::GCProfiler.new.profile_gc(@app, env)
+      # profile memory
+      if query_string =~ /pp=profile-memory/
+        query_params = Rack::Utils.parse_nested_query(query_string)
+        options = {
+          :ignore_files => query_params['memory_profiler_ignore_files'],
+          :allow_files => query_params['memory_profiler_allow_files'],
+        }
+        options[:top]= Integer(query_params['memory_profiler_top']) if query_params.key?('memory_profiler_top')
+        result = StringIO.new
+        report = MemoryProfiler.report(options) do
+          _,_,body = @app.call(env)
+          body.close if body.respond_to? :close
         end
+        report.pretty_print(result)
+        return client_settings.handle_cookie(text_result(result.string))
       end
 
       MiniProfiler.create_current(env, @config)
-      MiniProfiler.deauthorize_request if @config.authorization_mode == :whitelist
 
       if query_string =~ /pp=normal-backtrace/
         client_settings.backtrace_level = ClientSettings::BACKTRACE_DEFAULT
@@ -235,7 +235,6 @@ module Rack
       trace_exceptions = query_string =~ /pp=trace-exceptions/ && defined? TracePoint
       status, headers, body, exceptions,trace = nil
 
-      start = Time.now
 
       if trace_exceptions
         exceptions = []
@@ -253,6 +252,10 @@ module Rack
           env['HTTP_IF_MODIFIED_SINCE'] = ''
           env['HTTP_IF_NONE_MATCH']     = ''
         end
+
+        orig_accept_encoding = env['HTTP_ACCEPT_ENCODING']
+        # Prevent response body from being compressed
+        env['HTTP_ACCEPT_ENCODING'] = 'identity' if config.suppress_encoding
 
         if query_string =~ /pp=flamegraph/
           unless defined?(Flamegraph) && Flamegraph.respond_to?(:generate)
@@ -278,43 +281,38 @@ module Rack
         else
           status,headers,body = @app.call(env)
         end
-        client_settings.write!(headers)
       ensure
         trace.disable if trace
+        env['HTTP_ACCEPT_ENCODING'] = orig_accept_encoding if config.suppress_encoding
       end
 
       skip_it = current.discard
 
       if (config.authorization_mode == :whitelist && !MiniProfiler.request_authorized?)
-        # this is non-obvious, don't kill the profiling cookie on errors or short requests
-        # this ensures that stuff that never reaches the rails stack does not kill profiling
-        if status == 200 && ((Time.now - start) > 0.1)
-          client_settings.discard_cookie!(headers)
-        end
         skip_it = true
       end
 
-      return [status,headers,body] if skip_it
+      return client_settings.handle_cookie([status,headers,body]) if skip_it
 
       # we must do this here, otherwise current[:discard] is not being properly treated
       if trace_exceptions
         body.close if body.respond_to? :close
-        return dump_exceptions exceptions
+        return client_settings.handle_cookie(dump_exceptions exceptions)
       end
 
-      if query_string =~ /pp=env/
+      if query_string =~ /pp=env/ && !config.disable_env_dump
         body.close if body.respond_to? :close
-        return dump_env env
+        return client_settings.handle_cookie(dump_env env)
       end
 
       if query_string =~ /pp=analyze-memory/
         body.close if body.respond_to? :close
-        return analyze_memory
+        return client_settings.handle_cookie(analyze_memory)
       end
 
       if query_string =~ /pp=help/
         body.close if body.respond_to? :close
-        return help(client_settings, env)
+        return client_settings.handle_cookie(help(client_settings, env))
       end
 
       page_struct = current.page_struct
@@ -323,7 +321,7 @@ module Rack
 
       if flamegraph
         body.close if body.respond_to? :close
-        return self.flamegraph(flamegraph)
+        return client_settings.handle_cookie(self.flamegraph(flamegraph))
       end
 
 
@@ -333,10 +331,9 @@ module Rack
         @storage.save(page_struct)
 
         # inject headers, script
-        if headers['Content-Type'] && status == 200
-          client_settings.write!(headers)
+        if status >= 200 && status < 300
           result = inject_profiler(env,status,headers,body)
-          return result if result
+          return client_settings.handle_cookie(result) if result
         end
       rescue Exception => e
         if @config.storage_failure != nil
@@ -344,8 +341,7 @@ module Rack
         end
       end
 
-      client_settings.write!(headers)
-      [status, headers, body]
+      client_settings.handle_cookie([status, headers, body])
 
     ensure
       # Make sure this always happens
@@ -386,39 +382,17 @@ module Rack
     end
 
     def inject(fragment, script)
-      if fragment.match(/<\/body>/i)
-        # explicit </body>
-
-        regex = /<\/body>/i
-        close_tag = '</body>'
-      elsif fragment.match(/<\/html>/i)
-        # implicit </body>
-
-        regex = /<\/html>/i
-        close_tag = '</html>'
-      else
-        # implicit </body> and </html>. Don't do anything.
-
-        return fragment
-      end
-
-      matches = fragment.scan(regex).length
-      index = 1
-      fragment.gsub(regex) do
-        # though malformed there is an edge case where /body exists earlier in the html, work around
-        if index < matches
-          index += 1
-          close_tag
-        else
-
-          # if for whatever crazy reason we dont get a utf string,
-          #   just force the encoding, no utf in the mp scripts anyway
-          if script.respond_to?(:encoding) && script.respond_to?(:force_encoding)
-            (script + close_tag).force_encoding(fragment.encoding)
-          else
-            script + close_tag
-          end
+      # find explicit or implicit body
+      index = fragment.rindex(/<\/body>/i) || fragment.rindex(/<\/html>/i)
+      if index
+        # if for whatever crazy reason we dont get a utf string,
+        #   just force the encoding, no utf in the mp scripts anyway
+        if script.respond_to?(:encoding) && script.respond_to?(:force_encoding)
+          script = script.force_encoding(fragment.encoding)
         end
+        fragment.insert(index, script)
+      else
+        fragment
       end
     end
 
@@ -515,10 +489,10 @@ module Rack
       trim_strings(strings, max_size)
 
       body << "\n\n\n1000 Largest strings:\n\n"
-      body << strings.map{|s,len| "#{s}\n(len: #{len})\n\n"}.join("\n")
+      body << strings.map{|s,len| "#{s[0..1000]}\n(len: #{len})\n\n"}.join("\n")
 
       body << "\n\n\n1000 Sample strings:\n\n"
-      body << sample_strings.map{|s,len| "#{s}\n(len: #{len})\n\n"}.join("\n")
+      body << sample_strings.map{|s,len| "#{s[0..1000]}\n(len: #{len})\n\n"}.join("\n")
 
       body << "\n\n\n1000 Most common strings:\n\n"
       body << string_counts.sort{|a,b| b[1] <=> a[1]}[0..max_size].map{|s,len| "#{trunc.call(s)}\n(x #{len})\n\n"}.join("\n")
@@ -551,19 +525,17 @@ Append the following to your query string:
   #{make_link "disable", env} : disable profiling for this session
   #{make_link "enable", env} : enable profiling for this session (if previously disabled)
   #{make_link "profile-gc", env} : perform gc profiling on this request, analyzes ObjectSpace generated by request (ruby 1.9.3 only)
-  #{make_link "profile-gc-time", env} : perform built-in gc profiling on this request (ruby 1.9.3 only)
-  #{make_link "profile-gc-ruby-head", env} : requires the memory_profiler gem, new location based report
+  #{make_link "profile-memory", env} : requires the memory_profiler gem, new location based report
   #{make_link "flamegraph", env} : works best on Ruby 2.0, a graph representing sampled activity (requires the flamegraph gem).
   #{make_link "flamegraph&flamegraph_sample_rate=1", env}: creates a flamegraph with the specified sample rate (in ms). Overrides value set in config
   #{make_link "flamegraph_embed", env} : works best on Ruby 2.0, a graph representing sampled activity (requires the flamegraph gem), embedded resources for use on an intranet.
-  #{make_link "trace-exceptions", env} : requires Ruby 2.0, will return all the spots where your application raises execptions
+  #{make_link "trace-exceptions", env} : requires Ruby 2.0, will return all the spots where your application raises exceptions
   #{make_link "analyze-memory", env} : requires Ruby 2.0, will perform basic memory analysis of heap
 </pre>
 </body>
 </html>
 "
 
-      client_settings.write!(headers)
       [200, headers, [body]]
     end
 
@@ -573,8 +545,12 @@ Append the following to your query string:
     end
 
     def ids(env)
-      # cap at 10 ids, otherwise there is a chance you can blow the header
-      ([current.page_struct[:id]] + (@storage.get_unviewed_ids(user(env)) || [])[0..8]).uniq
+      all = ([current.page_struct[:id]] + (@storage.get_unviewed_ids(user(env)) || [])).uniq
+      if all.size > @config.max_traces_to_show
+        all = all[0...@config.max_traces_to_show]
+        @storage.set_all_unviewed(user(env), all)
+      end
+      all
     end
 
     def ids_json(env)
@@ -592,19 +568,30 @@ Append the following to your query string:
     # * you have disabled auto append behaviour throught :auto_inject => false flag
     # * you do not want script to be automatically appended for the current page. You can also call cancel_auto_inject
     def get_profile_script(env)
-      path     = "#{env['RACK_MINI_PROFILER_ORIGINAL_SCRIPT_NAME']}#{@config.base_url_path}"
+      path = if ENV["PASSENGER_BASE_URI"] then
+        # added because the SCRIPT_NAME workaround below then
+        # breaks running under a prefix as permitted by Passenger. 
+        "#{ENV['PASSENGER_BASE_URI']}#{@config.base_url_path}"
+      elsif env["action_controller.instance"]
+        # Rails engines break SCRIPT_NAME; the following appears to discard SCRIPT_NAME
+        # since url_for appears documented to return any String argument unmodified
+        env["action_controller.instance"].url_for("#{@config.base_url_path}")
+      else
+        "#{env['RACK_MINI_PROFILER_ORIGINAL_SCRIPT_NAME']}#{@config.base_url_path}"
+      end
 
       settings = {
        :path            => path,
        :version         => MiniProfiler::ASSET_VERSION,
        :position        => @config.position,
-       :showTrivial     => false,
-       :showChildren    => false,
-       :maxTracesToShow => 10,
-       :showControls    => false,
+       :showTrivial     => @config.show_trivial,
+       :showChildren    => @config.show_children,
+       :maxTracesToShow => @config.max_traces_to_show,
+       :showControls    => @config.show_controls,
        :authorized      => true,
        :toggleShortcut  => @config.toggle_shortcut,
-       :startHidden     => @config.start_hidden
+       :startHidden     => @config.start_hidden,
+       :collapseResults => @config.collapse_results
       }
 
       if current && current.page_struct

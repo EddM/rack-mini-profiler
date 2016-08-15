@@ -4,9 +4,9 @@ module Rack::MiniProfilerRails
 
   # call direct if needed to do a defer init
   def self.initialize!(app)
-    
+
     raise "MiniProfilerRails initialized twice. Set `require: false' for rack-mini-profiler in your Gemfile" if @already_initialized
-      
+
     c = Rack::MiniProfiler.config
 
     # By default, only show the MiniProfiler in development mode.
@@ -24,8 +24,11 @@ module Rack::MiniProfilerRails
 
     c.skip_paths ||= []
 
+    if serves_static_assets?(app)
+      c.skip_paths << app.config.assets.prefix
+    end
+
     if Rails.env.development?
-      c.skip_paths << app.config.assets.prefix if app.respond_to? :assets
       c.skip_schema_queries = true
     end
 
@@ -40,7 +43,6 @@ module Rack::MiniProfilerRails
     # The file store is just so much less flaky
     base_path = Rails.application.config.paths['tmp'].first rescue "#{Rails.root}/tmp"
     tmp       = base_path + '/miniprofiler'
-    FileUtils.mkdir_p(tmp) unless File.exists?(tmp)
 
     c.storage_options = {:path => tmp}
     c.storage = Rack::MiniProfiler::FileStore
@@ -60,14 +62,41 @@ module Rack::MiniProfilerRails
     ActiveSupport.on_load(:action_view) do
       ::Rack::MiniProfiler.profile_method(ActionView::Template, :render) {|x,y| "Rendering: #{@virtual_path}"}
     end
-    
+
     @already_initialized = true
+  end
+
+  def self.serves_static_assets?(app)
+    config = app.config
+
+    if !config.respond_to?(:assets) || !config.assets.respond_to?(:prefix)
+      return false
+    end
+
+    if ::Rails.version >= "5.0.0"
+      ::Rails.configuration.public_file_server.enabled
+    elsif ::Rails.version >= "4.2.0"
+      ::Rails.configuration.serve_static_files
+    else
+      ::Rails.configuration.serve_static_assets
+    end
   end
 
   class Railtie < ::Rails::Railtie
 
     initializer "rack_mini_profiler.configure_rails_initialization" do |app|
       Rack::MiniProfilerRails.initialize!(app)
+    end
+
+    # Suppress compression when Rack::Deflater is lower in the middleware
+    # stack than Rack::MiniProfiler
+    config.after_initialize do |app|
+      middlewares = app.middleware.middlewares
+      if Rack::MiniProfiler.config.suppress_encoding.nil? &&
+          middlewares.include?(Rack::Deflater) &&
+          middlewares.index(Rack::Deflater) > middlewares.index(Rack::MiniProfiler)
+        Rack::MiniProfiler.config.suppress_encoding = true
+      end
     end
 
     # TODO: Implement something better here

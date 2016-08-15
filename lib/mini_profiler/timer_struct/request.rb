@@ -44,8 +44,16 @@ module Rack
           @page              = page
         end
 
+        def name
+          @attributes[:name]
+        end
+
         def duration_ms
           self[:duration_milliseconds]
+        end
+
+        def duration_ms_in_sql
+          @attributes[:duration_milliseconds_in_sql]
         end
 
         def start_ms
@@ -81,8 +89,8 @@ module Rack
           end
         end
 
-        def add_sql(query, elapsed_ms, page, skip_backtrace = false, full_backtrace = false)
-          TimerStruct::Sql.new(query, elapsed_ms, page, self , skip_backtrace, full_backtrace).tap do |timer|
+        def add_sql(query, elapsed_ms, page, params = nil, skip_backtrace = false, full_backtrace = false)
+          TimerStruct::Sql.new(query, elapsed_ms, page, self, params, skip_backtrace, full_backtrace).tap do |timer|
             self[:sql_timings].push(timer)
             timer[:parent_timing_id] = self[:id]
             self[:has_sql_timings]   = true

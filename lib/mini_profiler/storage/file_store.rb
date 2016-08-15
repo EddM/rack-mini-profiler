@@ -26,8 +26,14 @@ module Rack
         end
 
         private
-        def path(key)
-          @path + "/" + @prefix  + "_" + key
+        if RUBY_PLATFORM =~ /mswin(?!ce)|mingw|cygwin|bccwin/
+          def path(key)
+            @path + "/" + @prefix  + "_" + key.gsub(/:/, '_')
+          end
+        else
+          def path(key)
+            @path + "/" + @prefix  + "_" + key
+          end
         end
       end
 
@@ -38,10 +44,15 @@ module Rack
         @path = args[:path]
         @expires_in_seconds = args[:expires_in] || EXPIRES_IN_SECONDS
         raise ArgumentError.new :path unless @path
+        FileUtils.mkdir_p(@path) unless ::File.exists?(@path)
+
         @timer_struct_cache = FileCache.new(@path, "mp_timers")
         @timer_struct_lock  = Mutex.new
         @user_view_cache    = FileCache.new(@path, "mp_views")
         @user_view_lock     = Mutex.new
+
+        @auth_token_cache    = FileCache.new(@path, "tokens")
+        @auth_token_lock     = Mutex.new
 
         me = self
         t = CacheCleanupThread.new do
@@ -106,9 +117,37 @@ module Rack
         }
       end
 
+      def set_all_unviewed(user, ids)
+        @user_view_lock.synchronize {
+          @user_view_cache[user] = ids.uniq
+        }
+      end
+
       def get_unviewed_ids(user)
         @user_view_lock.synchronize {
           @user_view_cache[user]
+        }
+      end
+
+      def flush_tokens
+        @auth_token_lock.synchronize {
+          @auth_token_cache[""] = nil
+        }
+      end
+
+      def allowed_tokens
+        @auth_token_lock.synchronize {
+          token1, token2, cycle_at = @auth_token_cache[""]
+
+          unless cycle_at && (Time === cycle_at) && (cycle_at > Time.now)
+            token2 = token1
+            token1 = SecureRandom.hex
+            cycle_at = Time.now + Rack::MiniProfiler::AbstractStore::MAX_TOKEN_AGE
+          end
+
+          @auth_token_cache[""] = [token1, token2, cycle_at]
+
+          [token1, token2].compact
         }
       end
 
